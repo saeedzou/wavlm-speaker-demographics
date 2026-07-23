@@ -5,13 +5,13 @@
 #
 # Usage:
 #   ./run_layer_sweep.sh
-#   LAYER_START=0 LAYER_END=12 LAYER_STRIDE=2 MODEL=microsoft/wavlm-base-plus ./run_layer_sweep.sh
+#   LAYER_START=0 LAYER_END=24 LAYER_STRIDE=2 MODEL=microsoft/wavlm-large ./run_layer_sweep.sh
 
 set -euo pipefail
 
-MODEL="${MODEL:-microsoft/wavlm-base-plus}"
+MODEL="${MODEL:-microsoft/wavlm-large}"
 LAYER_START="${LAYER_START:-0}"
-LAYER_END="${LAYER_END:-12}"       # inclusive; 12 for wavlm-base-plus (13 hidden_states: 0..12)
+LAYER_END="${LAYER_END:-24}"       # inclusive; 24 for wavlm-large (25 hidden_states: 0..24)
 LAYER_STRIDE="${LAYER_STRIDE:-1}"
 RESULTS_DIR="${RESULTS_DIR:-results}"
 EXTRA_ARGS=(--model "$MODEL")      # add e.g. --max_train_samples 2000 here while testing
