@@ -16,15 +16,15 @@ from wavlm_common import (
 RAW_AGE_COLUMN = "age"
 LABEL_COLUMN = "age_bin"
 AGE_BINS = {
-    "teens": "young",
-    "twenties": "young",
-    "thirties": "middle",
-    "fourties": "middle",
-    "fifties": "old",
-    "sixties": "old",
-    "seventies": "old",
-    "eighties": "old",
-    "nineties": "old",
+    "teens": "teens",
+    "twenties": "twenties",
+    "thirties": "thirties_fourties",
+    "fourties": "thirties_fourties",
+    "fifties": "fifties_plus",
+    "sixties": "fifties_plus",
+    "seventies": "fifties_plus",
+    "eighties": "fifties_plus",
+    "nineties": "fifties_plus",
 }
 
 
