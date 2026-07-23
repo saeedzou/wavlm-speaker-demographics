@@ -9,7 +9,7 @@ from wavlm_common import (
     build_label_mapping,
     filter_labeled,
     get_metrics_csv_path,
-    load_or_compute_embeddings,
+    load_embeddings,
     load_split,
     sample_verification_trials,
     set_seed,
@@ -85,8 +85,8 @@ def main():
         + ", ".join(f"{k}: {v}" for k, v in sorted(test_counts.items(), key=lambda x: (-x[1], x[0])))
     )
 
-    embeddings, labels = load_or_compute_embeddings(
-        full_dataset, LABEL_COLUMN, label2id, args.model, args.layer, args.device, args.batch_size, args.seed, args.cache_dir
+    embeddings, labels = load_embeddings(
+        full_dataset, LABEL_COLUMN, label2id, args.model, args.layer, args.device, args.batch_size
     )
 
     unique_speakers = np.unique(labels)

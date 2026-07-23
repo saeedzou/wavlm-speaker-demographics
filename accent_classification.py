@@ -7,7 +7,7 @@ from wavlm_common import (
     filter_labeled,
     filter_to_labels,
     get_label_list,
-    load_or_compute_embeddings,
+    load_embeddings,
     load_split,
     set_seed,
     train_eval,
@@ -61,14 +61,14 @@ def main():
         + ", ".join(f"{label}: {test_counts.get(label,0)}" for label in label_list)
     )
 
-    X_train, y_train = load_or_compute_embeddings(
-        train_dataset, LABEL_COLUMN, label2id, args.model, args.layer, args.device, args.batch_size, args.seed, args.cache_dir
+    X_train, y_train = load_embeddings(
+        train_dataset, LABEL_COLUMN, label2id, args.model, args.layer, args.device, args.batch_size
     )
-    X_val, y_val = load_or_compute_embeddings(
-        val_dataset, LABEL_COLUMN, label2id, args.model, args.layer, args.device, args.batch_size, args.seed, args.cache_dir
+    X_val, y_val = load_embeddings(
+        val_dataset, LABEL_COLUMN, label2id, args.model, args.layer, args.device, args.batch_size
     )
-    X_test, y_test = load_or_compute_embeddings(
-        test_dataset, LABEL_COLUMN, label2id, args.model, args.layer, args.device, args.batch_size, args.seed, args.cache_dir
+    X_test, y_test = load_embeddings(
+        test_dataset, LABEL_COLUMN, label2id, args.model, args.layer, args.device, args.batch_size
     )
 
     acc, report, metrics_csv = train_eval(

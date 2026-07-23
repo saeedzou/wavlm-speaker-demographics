@@ -5,8 +5,7 @@ This workspace contains four evaluation scripts built on top of a shared WavLM e
 ## What This Does
 
 - Extracts WavLM embeddings from a selectable hidden layer
-- Uses seeded 3-second crops from each utterance
-- Caches embeddings on disk so repeated task runs can reuse them
+- Uses random 3-second crops from each utterance when embeddings are computed
 - Runs a downstream classifier for gender, accent, and age
 - Runs open-set speaker verification using `client_id`
 - Uses a validation split for early stopping
@@ -51,7 +50,6 @@ Each script supports CLI flags for the WavLM model and the hidden layer:
 - `--train_split`, `--val_split`, and `--test_split`
 - `--max_train_samples`, `--max_val_samples`, and `--max_test_samples`
 - `--device`, `--batch_size`, and classifier hyperparameters
-- `--cache_dir` to choose where embedding caches are stored
 - `--metrics_csv` to write per-epoch metrics and the final test summary to a CSV file
 
 ### Gender
@@ -111,7 +109,6 @@ For speaker verification:
 
 ## Notes
 
-- The scripts use seeded cropping, so results can vary with the seed but remain reproducible and cache-friendly.
-- Embeddings are cached under `.cache/wavlm_embeddings` by default.
+- The scripts use random cropping when embeddings are computed, so rerunning a script can produce a different crop.
 - For smaller subsets, stratified validation splitting may fail if classes are too sparse.
 - If you want faster smoke tests, start with small `--max_train_samples` and `--max_test_samples` values.

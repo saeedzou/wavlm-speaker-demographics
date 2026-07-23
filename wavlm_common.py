@@ -1,7 +1,5 @@
 import argparse
 import csv
-import hashlib
-import json
 import random
 import time
 from itertools import combinations
@@ -22,8 +20,6 @@ from transformers import WavLMModel, Wav2Vec2FeatureExtractor
 SAMPLE_RATE = 16000
 CROP_SECONDS = 3.0
 DATASET_NAME = "saeedzou/common-voice-17-en-age-gender-sampled"
-EMBEDDING_CACHE_VERSION = 1
-DEFAULT_EMBEDDING_CACHE_DIR = Path(__file__).resolve().parent / ".cache" / "wavlm_embeddings"
 
 
 def set_seed(seed):
@@ -55,7 +51,6 @@ def build_arg_parser(description):
     parser.add_argument("--clf_batch_size", type=int, default=64)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--patience", type=int, default=7)
-    parser.add_argument("--cache_dir", default=str(DEFAULT_EMBEDDING_CACHE_DIR), help="directory used to cache embeddings")
     parser.add_argument("--metrics_csv", default=None, help="path to save per-epoch and final metrics as CSV")
     return parser
 
@@ -76,45 +71,6 @@ def load_wavlm(model_name, device):
     model = WavLMModel.from_pretrained(model_name, output_hidden_states=True)
     model.to(device).eval()
     return extractor, model
-
-
-def _dataset_fingerprint(dataset):
-    return getattr(dataset, "_fingerprint", None) or f"len-{len(dataset)}"
-
-
-def _embedding_cache_payload(dataset, label_column, model_name, layer, device, seed):
-    return {
-        "version": EMBEDDING_CACHE_VERSION,
-        "dataset_fingerprint": _dataset_fingerprint(dataset),
-        "dataset_size": len(dataset),
-        "label_column": label_column,
-        "model_name": model_name,
-        "layer": layer,
-        "device": device,
-        "seed": seed,
-        "sample_rate": SAMPLE_RATE,
-        "crop_seconds": CROP_SECONDS,
-    }
-
-
-def get_embeddings_cache_path(dataset, label_column, model_name, layer, device, seed, cache_dir=None):
-    cache_root = Path(cache_dir) if cache_dir is not None else DEFAULT_EMBEDDING_CACHE_DIR
-    cache_root.mkdir(parents=True, exist_ok=True)
-    payload = _embedding_cache_payload(dataset, label_column, model_name, layer, device, seed)
-    digest = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
-    return cache_root / f"{digest}.npz"
-
-
-def load_cached_embeddings(cache_path):
-    if cache_path is None or not cache_path.exists():
-        return None
-    with np.load(cache_path, allow_pickle=False) as cached:
-        return cached["X"], cached["y"]
-
-
-def save_cached_embeddings(cache_path, X, y):
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(cache_path, X=X, y=y)
 
 
 def load_split(split, max_samples=None, dataset_repo=DATASET_NAME):
@@ -145,32 +101,21 @@ def filter_to_labels(dataset, column, allowed_labels):
     return dataset.filter(lambda x: x[column] in allowed)
 
 
-def crop_or_pad(waveform, seconds=CROP_SECONDS, sr=SAMPLE_RATE, seed=None, key=None):
+def crop_or_pad(waveform, seconds=CROP_SECONDS, sr=SAMPLE_RATE):
     length = int(sr * seconds)
     n = waveform.shape[-1]
     if n >= length:
-        if seed is None or key is None:
-            start = random.randint(0, n - length)
-        else:
-            digest = hashlib.blake2b(f"{seed}:{key}".encode("utf-8"), digest_size=8).digest()
-            start = int.from_bytes(digest, byteorder="big") % (n - length + 1)
+        start = random.SystemRandom().randrange(0, n - length + 1)
         return waveform[start:start + length]
     return F.pad(waveform, (0, length - n))
 
 
-def load_waveform(audio, path=None, sr=SAMPLE_RATE, seed=None):
+def load_waveform(audio, sr=SAMPLE_RATE):
     waveform = torch.tensor(audio["array"], dtype=torch.float32)
     audio_sampling_rate = audio["sampling_rate"]
     if audio_sampling_rate != sr:
         waveform = torchaudio.functional.resample(waveform, audio_sampling_rate, sr)
-    crop_key = path
-    if crop_key is None:
-        crop_key = getattr(audio, "path", None)
-    if crop_key is None and isinstance(audio, dict):
-        crop_key = audio.get("path")
-    if crop_key is None:
-        crop_key = hashlib.sha1(waveform.numpy().tobytes()).hexdigest()
-    return crop_or_pad(waveform, sr=sr, seed=seed, key=crop_key)
+    return crop_or_pad(waveform, sr=sr)
 
 
 @torch.no_grad()
@@ -192,18 +137,18 @@ def embed_batch(waveforms, extractor, model, layer, device):
     return pooled.cpu().numpy()
 
 
-def compute_embeddings(dataset, label_column, label2id, extractor, model, layer, device, batch_size, seed=None):
+def compute_embeddings(dataset, label_column, label2id, extractor, model, layer, device, batch_size):
     X, y = [], []
     for i in tqdm(range(0, len(dataset), batch_size), desc="extracting embeddings"):
         batch = dataset[i:i + batch_size]
-        waveforms = [load_waveform(audio, path=path, seed=seed) for audio, path in zip(batch["audio"], batch["path"])]
+        waveforms = [load_waveform(audio) for audio in batch["audio"]]
         emb = embed_batch(waveforms, extractor, model, layer, device)
         X.append(emb)
         y.extend(label2id[label] for label in batch[label_column])
     return np.concatenate(X, axis=0), np.array(y)
 
 
-def load_or_compute_embeddings(
+def load_embeddings(
     dataset,
     label_column,
     label2id,
@@ -211,20 +156,9 @@ def load_or_compute_embeddings(
     layer,
     device,
     batch_size,
-    seed,
-    cache_dir=None,
 ):
-    cache_path = get_embeddings_cache_path(dataset, label_column, model_name, layer, device, seed, cache_dir)
-    cached = load_cached_embeddings(cache_path)
-    if cached is not None:
-        print(f"loaded cached embeddings from {cache_path}")
-        return cached
-
     extractor, model = load_wavlm(model_name, device)
-    X, y = compute_embeddings(dataset, label_column, label2id, extractor, model, layer, device, batch_size, seed=seed)
-    save_cached_embeddings(cache_path, X, y)
-    print(f"saved embeddings cache to {cache_path}")
-    return X, y
+    return compute_embeddings(dataset, label_column, label2id, extractor, model, layer, device, batch_size)
 
 
 class ResidualBlock(torch.nn.Module):
