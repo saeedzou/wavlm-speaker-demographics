@@ -45,9 +45,10 @@ def main():
         test_dataset, LABEL_COLUMN, label2id, args.model, args.layer, args.device, args.batch_size, args.seed, args.cache_dir
     )
 
-    acc, report = train_eval(X_train, y_train, X_test, y_test, id2label, args)
+    acc, report, metrics_csv = train_eval(X_train, y_train, X_test, y_test, id2label, args, "age_classification")
     print(f"age accuracy: {acc:.4f}")
     print(report)
+    print(f"age metrics csv: {metrics_csv}")
 
 
 if __name__ == "__main__":

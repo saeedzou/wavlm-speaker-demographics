@@ -1,4 +1,5 @@
 import argparse
+import csv
 import hashlib
 import json
 import random
@@ -53,6 +54,7 @@ def build_arg_parser(description):
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--patience", type=int, default=7)
     parser.add_argument("--cache_dir", default=str(DEFAULT_EMBEDDING_CACHE_DIR), help="directory used to cache embeddings")
+    parser.add_argument("--metrics_csv", default=None, help="path to save per-epoch and final metrics as CSV")
     return parser
 
 
@@ -273,8 +275,49 @@ def safe_stratified_split(X, y, test_size, random_state):
         ) from exc
 
 
-def train_eval(X_train, y_train, X_test, y_test, id2label, args):
+TRAINING_METRICS_FIELDNAMES = [
+    "run_id",
+    "task",
+    "stage",
+    "epoch",
+    "train_loss",
+    "val_loss",
+    "val_acc",
+    "epoch_time_s",
+    "eta_s",
+    "best_epoch",
+    "best_val_acc",
+    "test_acc",
+    "classification_report",
+    "model",
+    "layer",
+    "seed",
+    "loss",
+    "focal_gamma",
+    "device",
+]
+
+
+def get_metrics_csv_path(task_name, args):
+    custom_path = getattr(args, "metrics_csv", None)
+    if custom_path:
+        return Path(custom_path)
+    metrics_dir = Path(__file__).resolve().parent / "metrics"
+    return metrics_dir / f"{task_name}_metrics.csv"
+
+
+def save_training_metrics_csv(metrics_path, rows):
+    metrics_path = Path(metrics_path)
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    with metrics_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=TRAINING_METRICS_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def train_eval(X_train, y_train, X_test, y_test, id2label, args, task_name):
     device = args.device
+    run_id = time.strftime("%Y%m%d-%H%M%S")
     class_ids, class_counts = np.unique(y_train, return_counts=True)
     distribution = ", ".join(
         f"{id2label[int(class_id)]}: {int(class_count)}" for class_id, class_count in zip(class_ids, class_counts)
@@ -314,6 +357,8 @@ def train_eval(X_train, y_train, X_test, y_test, id2label, args):
         return F.cross_entropy(logits, targets)
 
     best_val_acc, best_state, patience_left = 0.0, None, args.patience
+    best_epoch = None
+    epoch_rows = []
     start_time = time.perf_counter()
     for epoch in range(args.epochs):
         epoch_start = time.perf_counter()
@@ -360,10 +405,36 @@ def train_eval(X_train, y_train, X_test, y_test, id2label, args):
 
         if val_acc > best_val_acc:
             best_val_acc, best_state, patience_left = val_acc, {k: v.clone() for k, v in model.state_dict().items()}, args.patience
+            best_epoch = epoch + 1
         else:
             patience_left -= 1
-            if patience_left <= 0:
-                break
+
+        epoch_rows.append(
+            {
+                "run_id": run_id,
+                "task": task_name,
+                "stage": "epoch",
+                "epoch": epoch + 1,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "val_acc": val_acc,
+                "epoch_time_s": epoch_elapsed,
+                "eta_s": remaining_seconds,
+                "best_epoch": best_epoch,
+                "best_val_acc": best_val_acc,
+                "test_acc": None,
+                "classification_report": None,
+                "model": args.model,
+                "layer": args.layer,
+                "seed": args.seed,
+                "loss": args.loss,
+                "focal_gamma": args.focal_gamma,
+                "device": device,
+            }
+        )
+
+        if patience_left <= 0:
+            break
 
     model.load_state_dict(best_state)
     model.eval()
@@ -379,7 +450,35 @@ def train_eval(X_train, y_train, X_test, y_test, id2label, args):
     labels = sorted(id2label)
     target_names = [id2label[i] for i in labels]
     report = classification_report(all_labels, all_preds, labels=labels, target_names=target_names, zero_division=0)
-    return acc, report
+
+    metrics_rows = [
+        *epoch_rows,
+        {
+            "run_id": run_id,
+            "task": task_name,
+            "stage": "final",
+            "epoch": None,
+            "train_loss": None,
+            "val_loss": None,
+            "val_acc": None,
+            "epoch_time_s": None,
+            "eta_s": None,
+            "best_epoch": best_epoch,
+            "best_val_acc": best_val_acc,
+            "test_acc": acc,
+            "classification_report": report,
+            "model": args.model,
+            "layer": args.layer,
+            "seed": args.seed,
+            "loss": args.loss,
+            "focal_gamma": args.focal_gamma,
+            "device": device,
+        },
+    ]
+    metrics_path = get_metrics_csv_path(task_name, args)
+    save_training_metrics_csv(metrics_path, metrics_rows)
+    print(f"saved metrics csv to {metrics_path}")
+    return acc, report, metrics_path
 
 
 def cosine_similarity(a, b):

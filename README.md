@@ -52,6 +52,7 @@ Each script supports CLI flags for the WavLM model and the hidden layer:
 - `--max_train_samples` and `--max_test_samples`
 - `--device`, `--batch_size`, and classifier hyperparameters
 - `--cache_dir` to choose where embedding caches are stored
+- `--metrics_csv` to write per-epoch metrics and the final test summary to a CSV file
 
 ### Gender
 
@@ -94,7 +95,12 @@ For the supervised tasks:
 - Validation metrics are printed every epoch with ETA.
 - Early stopping uses validation accuracy.
 - The test split is used only for the final report.
+- Each supervised run also writes a CSV with per-epoch metrics and a final summary row.
 - Learning-rate annealing is enabled through cosine annealing.
+
+For speaker verification:
+
+- Each run writes calibration and evaluation metrics to a CSV file.
 
 For speaker verification:
 

@@ -1,3 +1,4 @@
+import csv
 import numpy as np
 from datasets import concatenate_datasets
 from sklearn.model_selection import train_test_split
@@ -6,6 +7,7 @@ from wavlm_common import (
     build_arg_parser,
     build_label_mapping,
     filter_labeled,
+    get_metrics_csv_path,
     load_or_compute_embeddings,
     load_split,
     sample_verification_trials,
@@ -15,6 +17,33 @@ from wavlm_common import (
 
 
 LABEL_COLUMN = "client_id"
+
+VERIFICATION_METRICS_FIELDNAMES = [
+    "run_id",
+    "task",
+    "stage",
+    "roc_auc",
+    "eer",
+    "threshold",
+    "accept_accuracy",
+    "reject_rate",
+    "speaker_eval_ratio",
+    "pos_pairs_per_speaker",
+    "neg_pairs_per_speaker",
+    "model",
+    "layer",
+    "seed",
+    "device",
+]
+
+
+def save_verification_metrics_csv(metrics_path, rows):
+    metrics_path = metrics_path.resolve()
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    with metrics_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=VERIFICATION_METRICS_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def embeddings_by_label(embeddings, labels):
@@ -84,6 +113,45 @@ def main():
     evaluation_accept_accuracy = float((evaluation_predictions == evaluation_labels).mean())
     evaluation_reject_rate = float(((evaluation_predictions == 0) & (evaluation_labels == 0)).sum() / max((evaluation_labels == 0).sum(), 1))
 
+    metrics_rows = [
+        {
+            "run_id": f"{args.seed}-{args.model}-{args.layer}",
+            "task": "speaker_verification",
+            "stage": "calibration",
+            "roc_auc": calibration_summary["roc_auc"],
+            "eer": calibration_summary["eer"],
+            "threshold": calibration_summary["threshold"],
+            "accept_accuracy": None,
+            "reject_rate": None,
+            "speaker_eval_ratio": args.speaker_eval_ratio,
+            "pos_pairs_per_speaker": args.pos_pairs_per_speaker,
+            "neg_pairs_per_speaker": args.neg_pairs_per_speaker,
+            "model": args.model,
+            "layer": args.layer,
+            "seed": args.seed,
+            "device": args.device,
+        },
+        {
+            "run_id": f"{args.seed}-{args.model}-{args.layer}",
+            "task": "speaker_verification",
+            "stage": "evaluation",
+            "roc_auc": evaluation_summary["roc_auc"],
+            "eer": evaluation_summary["eer"],
+            "threshold": calibration_summary["threshold"],
+            "accept_accuracy": evaluation_accept_accuracy,
+            "reject_rate": evaluation_reject_rate,
+            "speaker_eval_ratio": args.speaker_eval_ratio,
+            "pos_pairs_per_speaker": args.pos_pairs_per_speaker,
+            "neg_pairs_per_speaker": args.neg_pairs_per_speaker,
+            "model": args.model,
+            "layer": args.layer,
+            "seed": args.seed,
+            "device": args.device,
+        },
+    ]
+    metrics_path = get_metrics_csv_path("speaker_verification", args)
+    save_verification_metrics_csv(metrics_path, metrics_rows)
+
     print(f"speaker calibration ROC AUC: {calibration_summary['roc_auc']:.4f}")
     print(f"speaker calibration EER: {calibration_summary['eer']:.4f}")
     print(f"speaker threshold: {calibration_summary['threshold']:.4f}")
@@ -91,6 +159,7 @@ def main():
     print(f"speaker evaluation EER: {evaluation_summary['eer']:.4f}")
     print(f"speaker evaluation accept accuracy: {evaluation_accept_accuracy:.4f}")
     print(f"speaker evaluation reject rate: {evaluation_reject_rate:.4f}")
+    print(f"speaker metrics csv: {metrics_path}")
 
 
 if __name__ == "__main__":
