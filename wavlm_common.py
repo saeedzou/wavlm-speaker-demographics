@@ -156,12 +156,16 @@ def crop_or_pad(waveform, seconds=CROP_SECONDS, sr=SAMPLE_RATE, seed=None, key=N
     return F.pad(waveform, (0, length - n))
 
 
-def load_waveform(example, sr=SAMPLE_RATE, seed=None):
-    audio = example["audio"]
+def load_waveform(audio, path=None, sr=SAMPLE_RATE, seed=None):
     waveform = torch.tensor(audio["array"], dtype=torch.float32)
-    if audio["sampling_rate"] != sr:
-        waveform = torchaudio.functional.resample(waveform, audio["sampling_rate"], sr)
-    crop_key = audio.get("path")
+    audio_sampling_rate = audio["sampling_rate"]
+    if audio_sampling_rate != sr:
+        waveform = torchaudio.functional.resample(waveform, audio_sampling_rate, sr)
+    crop_key = path
+    if crop_key is None:
+        crop_key = getattr(audio, "path", None)
+    if crop_key is None and isinstance(audio, dict):
+        crop_key = audio.get("path")
     if crop_key is None:
         crop_key = hashlib.sha1(waveform.numpy().tobytes()).hexdigest()
     return crop_or_pad(waveform, sr=sr, seed=seed, key=crop_key)
@@ -190,7 +194,7 @@ def compute_embeddings(dataset, label_column, label2id, extractor, model, layer,
     X, y = [], []
     for i in tqdm(range(0, len(dataset), batch_size), desc="extracting embeddings"):
         batch = dataset[i:i + batch_size]
-        waveforms = [load_waveform({"audio": a}, seed=seed) for a in batch["audio"]]
+        waveforms = [load_waveform(audio, path=path, seed=seed) for audio, path in zip(batch["audio"], batch["path"])]
         emb = embed_batch(waveforms, extractor, model, layer, device)
         X.append(emb)
         y.extend(label2id[label] for label in batch[label_column])
