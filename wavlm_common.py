@@ -19,7 +19,7 @@ from transformers import WavLMModel, Wav2Vec2FeatureExtractor
 
 SAMPLE_RATE = 16000
 CROP_SECONDS = 3.0
-DATASET_NAME = "saeedzou/common-voice-17-en-age-gender-sampled"
+DATASET_NAME = "saeedzou/common-voice-17-en-age-gender-accent-sampled"
 
 
 def set_seed(seed):
