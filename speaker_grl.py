@@ -24,7 +24,7 @@ from wavlm_common import (
     load_waveform,
     set_seed,
 )
-
+from accent_label_mapping import normalize_accent_labels
 
 SPEAKER_COLUMN = "client_id"
 GENDER_COLUMN = "gender"
@@ -33,15 +33,15 @@ RAW_AGE_COLUMN = "age"
 AGE_COLUMN = "age_bin"
 
 AGE_BINS = {
-    "teens": "young",
-    "twenties": "young",
-    "thirties": "middle",
-    "fourties": "middle",
-    "fifties": "old",
-    "sixties": "old",
-    "seventies": "old",
-    "eighties": "old",
-    "nineties": "old",
+    "teens": "teens",
+    "twenties": "twenties",
+    "thirties": "thirties_fourties",
+    "fourties": "thirties_fourties",
+    "fifties": "fifties_plus",
+    "sixties": "fifties_plus",
+    "seventies": "fifties_plus",
+    "eighties": "fifties_plus",
+    "nineties": "fifties_plus",
 }
 
 
@@ -131,6 +131,7 @@ def prepare_split(split, max_samples, dataset_repo):
     dataset = load_split(split, max_samples, dataset_repo)
     dataset = filter_labeled(dataset, SPEAKER_COLUMN)
     dataset = filter_labeled(dataset, GENDER_COLUMN)
+    dataset = normalize_accent_labels(dataset, ACCENT_COLUMN)
     dataset = filter_labeled(dataset, ACCENT_COLUMN)
     dataset = filter_labeled(dataset, RAW_AGE_COLUMN)
     dataset = dataset.map(add_age_bin)
