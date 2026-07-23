@@ -70,14 +70,19 @@ def main():
     if len(train_dataset) == 0 or len(test_dataset) == 0:
         raise ValueError("Speaker verification requires labeled train and test splits with client_id values.")
 
-    label2id, id2label = build_label_mapping(train_dataset[LABEL_COLUMN])
+    # Build a single label mapping across ALL speakers in train + test
+    all_speakers = set(train_dataset[LABEL_COLUMN]) | set(test_dataset[LABEL_COLUMN])
+    label2id, id2label = build_label_mapping(all_speakers)
+
+    train_speakers = set(train_dataset[LABEL_COLUMN])
+    test_speakers = set(test_dataset[LABEL_COLUMN])
+
     print("Train:")
-    print(f"speaker identities ({len(label2id)}): {len(label2id)} unique client_id values")
+    print(f"speaker identities ({len(train_speakers)}): {len(train_speakers)} unique client_id values")
     print(f"combined samples: {len(train_dataset)}")
 
-    label2id, id2label = build_label_mapping(test_dataset[LABEL_COLUMN])
     print("Test:")
-    print(f"speaker identities ({len(label2id)}): {len(label2id)} unique client_id values")
+    print(f"speaker identities ({len(test_speakers)}): {len(test_speakers)} unique client_id values")
     print(f"combined samples: {len(test_dataset)}")
 
     X_train, y_train = load_embeddings(
