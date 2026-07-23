@@ -1,5 +1,6 @@
 from collections import Counter
 
+from accent_label_mapping import normalize_accent_labels
 from wavlm_common import (
     add_classification_loss_args,
     build_arg_parser,
@@ -24,12 +25,17 @@ def main():
     set_seed(args.seed)
 
     train_dataset = filter_labeled(
-        load_split(args.train_split, args.max_train_samples, args.dataset_repo), LABEL_COLUMN
+        normalize_accent_labels(load_split(args.train_split, args.max_train_samples, args.dataset_repo)),
+        LABEL_COLUMN,
     )
     val_dataset = filter_labeled(
-        load_split(args.val_split, args.max_val_samples, args.dataset_repo), LABEL_COLUMN
+        normalize_accent_labels(load_split(args.val_split, args.max_val_samples, args.dataset_repo)),
+        LABEL_COLUMN,
     )
-    test_dataset = filter_labeled(load_split(args.test_split, args.max_test_samples, args.dataset_repo), LABEL_COLUMN)
+    test_dataset = filter_labeled(
+        normalize_accent_labels(load_split(args.test_split, args.max_test_samples, args.dataset_repo)),
+        LABEL_COLUMN,
+    )
 
     if len(train_dataset) == 0:
         raise ValueError("No labeled training examples were found for accent classification.")
