@@ -81,7 +81,7 @@ def main():
     )
     X_val, y_val = load_embeddings(
         val_dataset,
-        split_name="val",
+        split_name="validation",
         label_column=LABEL_COLUMN,
         label2id=label2id,
         model_name=args.model,

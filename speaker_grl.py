@@ -575,7 +575,7 @@ def main():
     )
     X_val, y_val_age = load_embeddings(
         val_dataset,
-        split_name="val",
+        split_name="validation",
         label_column=AGE_COLUMN,
         label2id=age2id,
         model_name=args.model,
