@@ -35,8 +35,8 @@ AGE_COLUMN = "age_bin"
 AGE_BINS = {
     "teens": "teens",
     "twenties": "twenties",
-    "thirties": "thirties_fourties",
-    "fourties": "thirties_fourties",
+    "thirties": "thirties",
+    "fourties": "fourties",
     "fifties": "fifties_plus",
     "sixties": "fifties_plus",
     "seventies": "fifties_plus",
@@ -523,7 +523,7 @@ def main():
     speaker_labels = get_label_list(train_dataset, SPEAKER_COLUMN)
     gender_labels = get_label_list(train_dataset, GENDER_COLUMN)
     accent_labels = get_label_list(train_dataset, ACCENT_COLUMN)
-    age_labels = [label for label in ["young", "middle", "old"] if label in set(train_dataset[AGE_COLUMN])]
+    age_labels = [label for label in ["teens", "twenties", "thirties", "fourties", "fifties_plus"] if label in set(train_dataset[AGE_COLUMN])]
     if not age_labels:
         raise ValueError("No age-bin labels were found in the training split after binning.")
 
