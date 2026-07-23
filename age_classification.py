@@ -18,10 +18,10 @@ LABEL_COLUMN = "age_bin"
 AGE_BINS = {
     "teens": "young",
     "twenties": "young",
-    "thirties": "young",
+    "thirties": "middle",
     "fourties": "middle",
-    "fifties": "middle",
-    "sixties": "middle",
+    "fifties": "old",
+    "sixties": "old",
     "seventies": "old",
     "eighties": "old",
     "nineties": "old",
