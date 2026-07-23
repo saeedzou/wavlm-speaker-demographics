@@ -53,7 +53,7 @@ def main():
     val_dataset = filter_labeled(val_dataset.map(bin_age_label), LABEL_COLUMN)
     test_dataset = filter_labeled(test_dataset.map(bin_age_label), LABEL_COLUMN)
 
-    label_list = ["young", "middle", "old"]
+    label_list = ["teens", "twenties", "thirties_fourties", "fifties_plus"]
     val_dataset = filter_to_labels(val_dataset, LABEL_COLUMN, label_list)
     if len(val_dataset) == 0:
         raise ValueError("No labeled validation examples remain after binning age labels.")
