@@ -1,3 +1,5 @@
+from collections import Counter
+
 from wavlm_common import (
     add_classification_loss_args,
     build_arg_parser,
@@ -37,6 +39,16 @@ def main():
     label2id, id2label = build_label_mapping(label_list)
     print(f"gender classes ({len(label2id)}): {label_list}")
     print(f"train samples: {len(train_dataset)} | test samples: {len(test_dataset)}")
+    train_counts = Counter(train_dataset[LABEL_COLUMN])
+    test_counts = Counter(test_dataset[LABEL_COLUMN])
+    print(
+        "train class distribution: "
+        + ", ".join(f"{label}: {train_counts.get(label,0)}" for label in label_list)
+    )
+    print(
+        "test class distribution: "
+        + ", ".join(f"{label}: {test_counts.get(label,0)}" for label in label_list)
+    )
 
     X_train, y_train = load_or_compute_embeddings(
         train_dataset, LABEL_COLUMN, label2id, args.model, args.layer, args.device, args.batch_size, args.seed, args.cache_dir

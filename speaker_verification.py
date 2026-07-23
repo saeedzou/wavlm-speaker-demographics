@@ -1,5 +1,6 @@
 import csv
 import numpy as np
+from collections import Counter
 from datasets import concatenate_datasets
 from sklearn.model_selection import train_test_split
 
@@ -73,6 +74,16 @@ def main():
     label2id, id2label = build_label_mapping(full_dataset[LABEL_COLUMN])
     print(f"speaker identities ({len(label2id)}): {len(label2id)} unique client_id values")
     print(f"combined samples: {len(full_dataset)}")
+    train_counts = Counter(train_dataset[LABEL_COLUMN])
+    test_counts = Counter(test_dataset[LABEL_COLUMN])
+    print(
+        "train speaker distribution: "
+        + ", ".join(f"{k}: {v}" for k, v in sorted(train_counts.items(), key=lambda x: (-x[1], x[0])))
+    )
+    print(
+        "test speaker distribution: "
+        + ", ".join(f"{k}: {v}" for k, v in sorted(test_counts.items(), key=lambda x: (-x[1], x[0])))
+    )
 
     embeddings, labels = load_or_compute_embeddings(
         full_dataset, LABEL_COLUMN, label2id, args.model, args.layer, args.device, args.batch_size, args.seed, args.cache_dir
