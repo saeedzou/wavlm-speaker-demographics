@@ -77,6 +77,9 @@ def load_split(split, max_samples=None, dataset_repo=DATASET_NAME):
     ds = load_dataset(dataset_repo, split=split)
     if max_samples is not None:
         ds = ds.select(range(min(max_samples, len(ds))))
+    # Attach original row indices before any filtering occurs
+    if "orig_idx" not in ds.column_names:
+        ds = ds.add_column("orig_idx", list(range(len(ds))))
     return ds
 
 
@@ -149,10 +152,9 @@ def embed_batch_all_layers(waveforms, extractor, model, device):
 # --- Embedding Precomputation & Disk Caching ---
 
 def compute_chunk_variations(
-    dataset, label_column, label2id, extractor, model, device, batch_size, seed, num_chunks=3
+    dataset, extractor, model, device, batch_size, seed, num_chunks=3
 ):
     num_samples = len(dataset)
-    labels = np.array([label2id[label] for label in dataset[label_column]])
 
     X_chunks = []
     for chunk_idx in range(num_chunks):
@@ -166,7 +168,6 @@ def compute_chunk_variations(
                 load_waveform(audio, sample_idx=i + idx, epoch_idx=chunk_idx, seed=seed)
                 for idx, audio in enumerate(batch["audio"])
             ]
-            # Shape: [num_layers, batch_size, hidden_dim]
             emb = embed_batch_all_layers(waveforms, extractor, model, device)
             X_batches.append(emb)
 
@@ -174,7 +175,7 @@ def compute_chunk_variations(
         X_chunks.append(ep_embs)
 
     X_all = np.stack(X_chunks, axis=0)  # [num_chunks, num_layers, num_samples, hidden_dim]
-    return X_all, labels
+    return X_all
 
 
 def load_embeddings(
@@ -189,43 +190,48 @@ def load_embeddings(
     seed=42,
     num_chunks=3,
     cache_dir="./embeddings_cache",
+    dataset_repo=DATASET_NAME,
 ):
     cache_path = Path(cache_dir)
     clean_model = model_name.replace("/", "_")
 
-    # Folder for this split: embeddings_cache/emb_microsoft_wavlm-base-plus_train_seed42_chunks3_N1256/
-    split_dir = cache_path / f"emb_{clean_model}_{split_name}_seed{seed}_chunks{num_chunks}_N{len(dataset)}"
+    # Cache folder key is independent of task-specific filtering length
+    split_dir = cache_path / f"emb_{clean_model}_{split_name}_seed{seed}_chunks{num_chunks}"
     split_dir.mkdir(parents=True, exist_ok=True)
 
     layer_file = split_dir / f"layer_{layer}.pt"
 
-    # 1. Fast path: load ONLY the requested layer file from disk
-    if layer_file.exists():
-        print(f"Loading precomputed embeddings for layer {layer} from: {layer_file}")
-        cached = torch.load(layer_file, weights_only=False)
-        return cached["X"], cached["y"]
+    # 1. Compute path: Extract features for the FULL split if not already cached
+    if not layer_file.exists():
+        print(f"Precomputing embeddings for ALL layers of raw split '{split_name}'...")
+        raw_dataset = load_split(split_name, dataset_repo=dataset_repo)
+        extractor, model = load_wavlm(model_name, device)
+        X_all = compute_chunk_variations(
+            raw_dataset, extractor, model, device, batch_size, seed, num_chunks
+        )
 
-    # 2. Compute path: extract all layers once and save each layer into its own .pt file
-    print(f"Precomputing embeddings for ALL layers of '{split_name}' ({num_chunks} chunk variations)...")
-    extractor, model = load_wavlm(model_name, device)
-    X_all, y = compute_chunk_variations(
-        dataset, label_column, label2id, extractor, model, device, batch_size, seed, num_chunks
-    )
-    # X_all shape: [num_chunks, num_layers, num_samples, hidden_dim]
+        num_layers = X_all.shape[1]
+        print(f"Saving per-layer embeddings into folder: {split_dir}")
+        for l_idx in range(num_layers):
+            l_file = split_dir / f"layer_{l_idx}.pt"
+            torch.save({"X": X_all[:, l_idx]}, l_file)
+        torch.save({"X": X_all[:, -1]}, split_dir / "layer_-1.pt")
 
-    num_layers = X_all.shape[1]
-    print(f"Saving per-layer embeddings into folder: {split_dir}")
+    # 2. Fast path: Load layer embeddings from disk
+    print(f"Loading precomputed embeddings for layer {layer} from: {layer_file}")
+    cached = torch.load(layer_file, weights_only=False)
+    X_full = cached["X"]  # Shape: [num_chunks, N_full, hidden_dim]
 
-    # Save layer_0.pt, layer_1.pt, ..., layer_12.pt
-    for l_idx in range(num_layers):
-        l_file = split_dir / f"layer_{l_idx}.pt"
-        torch.save({"X": X_all[:, l_idx], "y": y}, l_file)
+    # Slice full embeddings down to match the filtered dataset rows
+    if "orig_idx" in dataset.column_names:
+        indices = dataset["orig_idx"]
+        X = X_full[:, indices] if X_full.ndim == 3 else X_full[indices]
+    else:
+        X = X_full
 
-    # Save layer_-1.pt as an alias for the final layer
-    torch.save({"X": X_all[:, -1], "y": y}, split_dir / "layer_-1.pt")
+    y = np.array([label2id[label] for label in dataset[label_column]])
+    return X, y
 
-    X_layer = X_all[:, layer]
-    return X_layer, y
 
 class ResidualBlock(torch.nn.Module):
     def __init__(self, dim, hidden, dropout):

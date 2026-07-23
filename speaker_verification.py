@@ -70,24 +70,34 @@ def main():
     if len(train_dataset) == 0 or len(test_dataset) == 0:
         raise ValueError("Speaker verification requires labeled train and test splits with client_id values.")
 
-    full_dataset = concatenate_datasets([train_dataset, test_dataset])
-    label2id, id2label = build_label_mapping(full_dataset[LABEL_COLUMN])
+    label2id, id2label = build_label_mapping(train_dataset[LABEL_COLUMN])
+    print("Train:")
     print(f"speaker identities ({len(label2id)}): {len(label2id)} unique client_id values")
-    print(f"combined samples: {len(full_dataset)}")
-    # train_counts = Counter(train_dataset[LABEL_COLUMN])
-    # test_counts = Counter(test_dataset[LABEL_COLUMN])
-    # print(
-    #     "train speaker distribution: "
-    #     + ", ".join(f"{k}: {v}" for k, v in sorted(train_counts.items(), key=lambda x: (-x[1], x[0])))
-    # )
-    # print(
-    #     "test speaker distribution: "
-    #     + ", ".join(f"{k}: {v}" for k, v in sorted(test_counts.items(), key=lambda x: (-x[1], x[0])))
-    # )
+    print(f"combined samples: {len(train_dataset)}")
 
-    embeddings, labels = load_embeddings(
-        full_dataset,
-        split_name="full",
+    label2id, id2label = build_label_mapping(test_dataset[LABEL_COLUMN])
+    print("Test:")
+    print(f"speaker identities ({len(label2id)}): {len(label2id)} unique client_id values")
+    print(f"combined samples: {len(test_dataset)}")
+
+    X_train, y_train = load_embeddings(
+        train_dataset,
+        split_name="train",
+        label_column=LABEL_COLUMN,
+        label2id=label2id,
+        model_name=args.model,
+        layer=args.layer,
+        device=args.device,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        num_chunks=3,
+    )
+    if X_train.ndim == 3:
+        X_train = X_train[0]  # Take 1st variation for verification trials
+
+    X_test, y_test = load_embeddings(
+        test_dataset,
+        split_name="test",
         label_column=LABEL_COLUMN,
         label2id=label2id,
         model_name=args.model,
@@ -97,9 +107,11 @@ def main():
         seed=args.seed,
         num_chunks=1,
     )
-    # 2. Select the single chunk variation: [1, num_samples, hidden_dim] -> [num_samples, hidden_dim]
-    if embeddings.ndim == 3:
-        embeddings = embeddings[0]
+    if X_test.ndim == 3:
+        X_test = X_test[0]
+
+    embeddings = np.concatenate([X_train, X_test], axis=0)
+    labels = np.concatenate([y_train, y_test], axis=0)
 
     unique_speakers = np.unique(labels)
     if unique_speakers.size < 4:
