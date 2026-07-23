@@ -32,8 +32,10 @@ def main():
     args = parser.parse_args()
     set_seed(args.seed)
 
-    train_dataset = filter_labeled(load_split(args.train_split, args.max_train_samples), LABEL_COLUMN)
-    test_dataset = filter_labeled(load_split(args.test_split, args.max_test_samples), LABEL_COLUMN)
+    train_dataset = filter_labeled(
+        load_split(args.train_split, args.max_train_samples, args.dataset_repo), LABEL_COLUMN
+    )
+    test_dataset = filter_labeled(load_split(args.test_split, args.max_test_samples, args.dataset_repo), LABEL_COLUMN)
 
     if len(train_dataset) == 0 or len(test_dataset) == 0:
         raise ValueError("Speaker verification requires labeled train and test splits with client_id values.")

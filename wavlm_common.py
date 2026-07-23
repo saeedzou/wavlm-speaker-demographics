@@ -34,6 +34,7 @@ def set_seed(seed):
 def build_arg_parser(description):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--model", default="microsoft/wavlm-base-plus")
+    parser.add_argument("--dataset_repo", default=DATASET_NAME, help="Hugging Face dataset repository to load")
     parser.add_argument("--layer", type=int, default=-1, help="hidden_states index, -1 for last")
     parser.add_argument("--train_split", default="train")
     parser.add_argument("--test_split", default="test")
@@ -112,8 +113,8 @@ def save_cached_embeddings(cache_path, X, y):
     np.savez_compressed(cache_path, X=X, y=y)
 
 
-def load_split(split, max_samples=None):
-    ds = load_dataset(DATASET_NAME, split=split)
+def load_split(split, max_samples=None, dataset_repo=DATASET_NAME):
+    ds = load_dataset(dataset_repo, split=split)
     if max_samples is not None:
         ds = ds.select(range(min(max_samples, len(ds))))
     return ds
