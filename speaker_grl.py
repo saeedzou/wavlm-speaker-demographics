@@ -2,27 +2,28 @@ import copy
 import csv
 import math
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, classification_report
-from torch.utils.data import DataLoader
-from transformers import WavLMModel, Wav2Vec2FeatureExtractor
+from sklearn.preprocessing import StandardScaler
 
 from wavlm_common import (
     ResidualMLP,
-    SAMPLE_RATE,
     build_arg_parser,
     build_label_mapping,
     filter_labeled,
     filter_to_labels,
     get_label_list,
     get_metrics_csv_path,
+    load_embeddings,
     load_split,
-    load_waveform,
+    sample_verification_trials,
     set_seed,
+    verification_metrics,
 )
 from accent_label_mapping import normalize_accent_labels
 
@@ -31,6 +32,9 @@ GENDER_COLUMN = "gender"
 ACCENT_COLUMN = "accent"
 RAW_AGE_COLUMN = "age"
 AGE_COLUMN = "age_bin"
+
+TRAIN_CHUNKS = 3
+EVAL_CHUNKS = 1
 
 AGE_BINS = {
     "teens": "teens",
@@ -59,11 +63,14 @@ MULTITASK_METRICS_FIELDNAMES = [
     "age_acc",
     "gender_acc",
     "accent_acc",
+    "speaker_eer",
+    "speaker_auc",
     "epoch_time_s",
     "eta_s",
     "best_epoch",
-    "best_val_speaker_acc",
-    "test_speaker_acc",
+    "best_val_speaker_eer",
+    "test_speaker_eer",
+    "test_speaker_auc",
     "test_age_acc",
     "test_gender_acc",
     "test_accent_acc",
@@ -73,7 +80,6 @@ MULTITASK_METRICS_FIELDNAMES = [
     "accent_classes",
     "model",
     "layer",
-    "trainable_layers",
     "seed",
     "alpha",
     "beta",
@@ -86,12 +92,6 @@ MULTITASK_METRICS_FIELDNAMES = [
 
 
 def add_grl_args(parser):
-    parser.add_argument(
-        "--trainable_layers",
-        type=int,
-        default=4,
-        help="number of top WavLM transformer layers to fine-tune; use -1 to freeze the encoder",
-    )
     parser.add_argument("--shared_dim", type=int, default=512, help="dimension of the pooled shared embedding")
     parser.add_argument(
         "--speaker_embed_dim",
@@ -139,8 +139,9 @@ def prepare_split(split, max_samples, dataset_repo):
     return dataset
 
 
-def filter_to_task_labels(dataset, speaker_labels, age_labels, gender_labels, accent_labels):
-    dataset = filter_to_labels(dataset, SPEAKER_COLUMN, speaker_labels)
+def filter_to_task_labels(dataset, age_labels, gender_labels, accent_labels, speaker_labels=None):
+    if speaker_labels is not None:
+        dataset = filter_to_labels(dataset, SPEAKER_COLUMN, speaker_labels)
     dataset = filter_to_labels(dataset, AGE_COLUMN, age_labels)
     dataset = filter_to_labels(dataset, GENDER_COLUMN, gender_labels)
     dataset = filter_to_labels(dataset, ACCENT_COLUMN, accent_labels)
@@ -156,19 +157,8 @@ def save_metrics_csv(metrics_path, rows):
         writer.writerows(rows)
 
 
-def load_wavlm_encoder(model_name, device, trainable_layers):
-    extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_name)
-    model = WavLMModel.from_pretrained(model_name, output_hidden_states=True)
-    for parameter in model.parameters():
-        parameter.requires_grad = False
-    if trainable_layers != -1 and trainable_layers > 0:
-        for block in model.encoder.layers[-trainable_layers:]:
-            for parameter in block.parameters():
-                parameter.requires_grad = True
-        for parameter in model.encoder.layer_norm.parameters():
-            parameter.requires_grad = True
-    model.to(device)
-    return extractor, model
+def labels_to_ids(dataset, column, label2id):
+    return np.array([label2id[label] for label in dataset[column]], dtype=np.int64)
 
 
 class GradientReversalFunction(torch.autograd.Function):
@@ -231,10 +221,16 @@ class AdversarialHead(torch.nn.Module):
 
 
 class SpeakerGRLModel(torch.nn.Module):
+    """Operates on precomputed (frozen) WavLM pooled embeddings, not raw audio.
+
+    The WavLM encoder is never part of this module or its gradient graph;
+    embeddings are precomputed once by wavlm_common.load_embeddings and cached
+    to disk, so this model only needs the embedding dimensionality.
+    """
+
     def __init__(
         self,
-        encoder,
-        layer,
+        embedding_dim,
         speaker_classes,
         age_classes,
         gender_classes,
@@ -242,11 +238,9 @@ class SpeakerGRLModel(torch.nn.Module):
         args,
     ):
         super().__init__()
-        self.encoder = encoder
-        self.layer = layer
         self.shared_projection = torch.nn.Sequential(
-            torch.nn.LayerNorm(self.encoder.config.hidden_size),
-            torch.nn.Linear(self.encoder.config.hidden_size, args.shared_dim),
+            torch.nn.LayerNorm(embedding_dim),
+            torch.nn.Linear(embedding_dim, args.shared_dim),
             torch.nn.GELU(),
             torch.nn.Dropout(args.dropout),
         )
@@ -268,25 +262,16 @@ class SpeakerGRLModel(torch.nn.Module):
         self.gender_head = AdversarialHead(args.shared_dim, gender_classes, args.dropout)
         self.accent_head = AdversarialHead(args.shared_dim, accent_classes, args.dropout)
 
-    def mean_pool(self, input_values, attention_mask):
-        outputs = self.encoder(input_values, attention_mask=attention_mask, output_hidden_states=True, return_dict=True)
-        hidden = outputs.hidden_states[self.layer]
-        feature_mask = self.encoder._get_feature_vector_attention_mask(hidden.shape[1], attention_mask)
-        feature_mask = feature_mask.unsqueeze(-1).float()
-        pooled = (hidden * feature_mask).sum(1) / feature_mask.sum(1).clamp(min=1)
-        return self.shared_projection(pooled)
-
     def forward(
         self,
-        input_values,
-        attention_mask,
+        features,
         speaker_labels=None,
         age_labels=None,
         gender_labels=None,
         accent_labels=None,
         grl_lambda=1.0,
     ):
-        shared_embedding = self.mean_pool(input_values, attention_mask)
+        shared_embedding = self.shared_projection(features)
         speaker_embedding = self.speaker_projection(shared_embedding)
         speaker_logits = self.speaker_head.logits(speaker_embedding)
 
@@ -317,39 +302,6 @@ class SpeakerGRLModel(torch.nn.Module):
         }
 
 
-def make_collate_fn(speaker2id, age2id, gender2id, accent2id):
-    def collate(batch):
-        waveforms = [load_waveform(item["audio"]) for item in batch]
-        return {
-            "waveforms": waveforms,
-            "speaker_labels": torch.tensor([speaker2id[item[SPEAKER_COLUMN]] for item in batch], dtype=torch.long),
-            "age_labels": torch.tensor([age2id[item[AGE_COLUMN]] for item in batch], dtype=torch.long),
-            "gender_labels": torch.tensor([gender2id[item[GENDER_COLUMN]] for item in batch], dtype=torch.long),
-            "accent_labels": torch.tensor([accent2id[item[ACCENT_COLUMN]] for item in batch], dtype=torch.long),
-        }
-
-    return collate
-
-
-def batch_to_model_inputs(batch, extractor, device):
-    audio_inputs = extractor(
-        [waveform.numpy() for waveform in batch["waveforms"]],
-        sampling_rate=SAMPLE_RATE,
-        return_tensors="pt",
-        padding=True,
-        return_attention_mask=True,
-    )
-    input_values = audio_inputs.input_values.to(device)
-    attention_mask = audio_inputs.attention_mask.to(device)
-    labels = {
-        "speaker_labels": batch["speaker_labels"].to(device),
-        "age_labels": batch["age_labels"].to(device),
-        "gender_labels": batch["gender_labels"].to(device),
-        "accent_labels": batch["accent_labels"].to(device),
-    }
-    return input_values, attention_mask, labels
-
-
 def ramp_lambda(step, ramp_steps):
     if ramp_steps <= 0:
         return 1.0
@@ -363,10 +315,13 @@ def compute_totals(outputs, args):
         "gender_loss": outputs["gender_loss"],
         "accent_loss": outputs["accent_loss"],
     }
-    total_loss = losses["speaker_loss"]
-    total_loss = total_loss + args.alpha * losses["age_loss"]
-    total_loss = total_loss + args.beta * losses["gender_loss"]
-    total_loss = total_loss + args.gamma * losses["accent_loss"]
+    total_loss = (
+        args.alpha * losses["age_loss"]
+        + args.beta * losses["gender_loss"]
+        + args.gamma * losses["accent_loss"]
+    )
+    if losses["speaker_loss"] is not None:
+        total_loss = total_loss + losses["speaker_loss"]
     return total_loss, losses
 
 
@@ -375,13 +330,38 @@ def accuracy_from_logits(logits, labels):
     return (predictions == labels).sum().item(), labels.size(0)
 
 
-def run_split(model, loader, extractor, device, args, train=False, optimizer=None, step_offset=0):
+def iter_batches(n, batch_size):
+    for start in range(0, n, batch_size):
+        yield start, min(start + batch_size, n)
+
+
+def run_split(
+    model,
+    features,
+    device,
+    args,
+    age_labels,
+    gender_labels,
+    accent_labels,
+    speaker_labels=None,
+    train=False,
+    optimizer=None,
+    step_offset=0,
+    shuffle_generator=None,
+):
+    """features: np.ndarray [num_samples, hidden_dim] (already scaled)."""
+    num_samples = features.shape[0]
+    order = np.arange(num_samples)
+    if shuffle_generator is not None:
+        shuffle_generator.shuffle(order)
+
     total_loss_sum = 0.0
     speaker_loss_sum = 0.0
     age_loss_sum = 0.0
     gender_loss_sum = 0.0
     accent_loss_sum = 0.0
     speaker_correct = 0
+    speaker_examples = 0
     age_correct = 0
     gender_correct = 0
     accent_correct = 0
@@ -392,38 +372,51 @@ def run_split(model, loader, extractor, device, args, train=False, optimizer=Non
     else:
         model.eval()
 
-    for step, batch in enumerate(loader, start=step_offset):
-        input_values, attention_mask, labels = batch_to_model_inputs(batch, extractor, device)
+    features_t_full = torch.tensor(features, dtype=torch.float32)
+    age_t_full = torch.tensor(age_labels, dtype=torch.long)
+    gender_t_full = torch.tensor(gender_labels, dtype=torch.long)
+    accent_t_full = torch.tensor(accent_labels, dtype=torch.long)
+    speaker_t_full = torch.tensor(speaker_labels, dtype=torch.long) if speaker_labels is not None else None
+
+    for step, (start, end) in enumerate(iter_batches(num_samples, args.clf_batch_size), start=step_offset):
+        idx = order[start:end]
+        feats = features_t_full[idx].to(device)
+        age_b = age_t_full[idx].to(device)
+        gender_b = gender_t_full[idx].to(device)
+        accent_b = accent_t_full[idx].to(device)
+        speaker_b = speaker_t_full[idx].to(device) if speaker_t_full is not None else None
+
         grl_lambda = ramp_lambda(step, args.grl_ramp_steps)
 
         with torch.set_grad_enabled(train):
             outputs = model(
-                input_values,
-                attention_mask,
-                speaker_labels=labels["speaker_labels"],
-                age_labels=labels["age_labels"],
-                gender_labels=labels["gender_labels"],
-                accent_labels=labels["accent_labels"],
+                feats,
+                speaker_labels=speaker_b,
+                age_labels=age_b,
+                gender_labels=gender_b,
+                accent_labels=accent_b,
                 grl_lambda=grl_lambda,
             )
             total_loss, losses = compute_totals(outputs, args)
 
-        batch_size = labels["speaker_labels"].size(0)
+        batch_size = age_b.size(0)
         total_loss_sum += total_loss.item() * batch_size
-        speaker_loss_sum += losses["speaker_loss"].item() * batch_size
+        if speaker_b is not None:
+            speaker_loss_sum += losses["speaker_loss"].item() * batch_size
+            speaker_hits, speaker_total = accuracy_from_logits(outputs["speaker_logits"], speaker_b)
+            speaker_correct += speaker_hits
+            speaker_examples += speaker_total
         age_loss_sum += losses["age_loss"].item() * batch_size
         gender_loss_sum += losses["gender_loss"].item() * batch_size
         accent_loss_sum += losses["accent_loss"].item() * batch_size
 
-        speaker_hits, speaker_total = accuracy_from_logits(outputs["speaker_logits"], labels["speaker_labels"])
-        age_hits, age_total = accuracy_from_logits(outputs["age_logits"], labels["age_labels"])
-        gender_hits, gender_total = accuracy_from_logits(outputs["gender_logits"], labels["gender_labels"])
-        accent_hits, accent_total = accuracy_from_logits(outputs["accent_logits"], labels["accent_labels"])
-        speaker_correct += speaker_hits
+        age_hits, age_total = accuracy_from_logits(outputs["age_logits"], age_b)
+        gender_hits, gender_total = accuracy_from_logits(outputs["gender_logits"], gender_b)
+        accent_hits, accent_total = accuracy_from_logits(outputs["accent_logits"], accent_b)
         age_correct += age_hits
         gender_correct += gender_hits
         accent_correct += accent_hits
-        total_examples += speaker_total
+        total_examples += age_total
 
         if train:
             optimizer.zero_grad()
@@ -432,15 +425,16 @@ def run_split(model, loader, extractor, device, args, train=False, optimizer=Non
 
     return {
         "total_loss": total_loss_sum / max(total_examples, 1),
-        "speaker_loss": speaker_loss_sum / max(total_examples, 1),
+        "speaker_loss": speaker_loss_sum / max(speaker_examples, 1),
         "age_loss": age_loss_sum / max(total_examples, 1),
         "gender_loss": gender_loss_sum / max(total_examples, 1),
         "accent_loss": accent_loss_sum / max(total_examples, 1),
-        "speaker_acc": speaker_correct / max(total_examples, 1),
+        "speaker_acc": speaker_correct / max(speaker_examples, 1),
         "age_acc": age_correct / max(total_examples, 1),
         "gender_acc": gender_correct / max(total_examples, 1),
         "accent_acc": accent_correct / max(total_examples, 1),
         "total_examples": total_examples,
+        "num_batches": (num_samples + args.clf_batch_size - 1) // args.clf_batch_size,
     }
 
 
@@ -455,51 +449,30 @@ def report_for_labels(targets, predictions, id2label):
     )
 
 
-def evaluate_reports(model, loader, extractor, device, age2id, id2age, gender2id, id2gender, accent2id, id2accent):
+@torch.no_grad()
+def evaluate_reports(model, features, device, age_labels, gender_labels, accent_labels, args, id2age, id2gender, id2accent):
     model.eval()
-    speaker_preds = []
-    speaker_targets = []
-    age_preds = []
-    age_targets = []
-    gender_preds = []
-    gender_targets = []
-    accent_preds = []
-    accent_targets = []
+    age_preds, gender_preds, accent_preds = [], [], []
+    features_t_full = torch.tensor(features, dtype=torch.float32)
 
-    with torch.no_grad():
-        for batch in loader:
-            input_values, attention_mask, labels = batch_to_model_inputs(batch, extractor, device)
-            outputs = model(
-                input_values,
-                attention_mask,
-                speaker_labels=None,
-                age_labels=None,
-                gender_labels=None,
-                accent_labels=None,
-                grl_lambda=1.0,
-            )
-            speaker_preds.extend(outputs["speaker_logits"].argmax(dim=1).cpu().tolist())
-            speaker_targets.extend(labels["speaker_labels"].tolist())
-            age_preds.extend(outputs["age_logits"].argmax(dim=1).cpu().tolist())
-            age_targets.extend(labels["age_labels"].tolist())
-            gender_preds.extend(outputs["gender_logits"].argmax(dim=1).cpu().tolist())
-            gender_targets.extend(labels["gender_labels"].tolist())
-            accent_preds.extend(outputs["accent_logits"].argmax(dim=1).cpu().tolist())
-            accent_targets.extend(labels["accent_labels"].tolist())
+    for start, end in iter_batches(features.shape[0], args.clf_batch_size):
+        feats = features_t_full[start:end].to(device)
+        outputs = model(feats, grl_lambda=1.0)
+        age_preds.extend(outputs["age_logits"].argmax(dim=1).cpu().tolist())
+        gender_preds.extend(outputs["gender_logits"].argmax(dim=1).cpu().tolist())
+        accent_preds.extend(outputs["accent_logits"].argmax(dim=1).cpu().tolist())
 
-    speaker_acc = accuracy_score(speaker_targets, speaker_preds)
-    age_acc = accuracy_score(age_targets, age_preds)
-    gender_acc = accuracy_score(gender_targets, gender_preds)
-    accent_acc = accuracy_score(accent_targets, accent_preds)
+    age_acc = accuracy_score(age_labels, age_preds)
+    gender_acc = accuracy_score(gender_labels, gender_preds)
+    accent_acc = accuracy_score(accent_labels, accent_preds)
 
     reports = {
-        "age": report_for_labels(age_targets, age_preds, id2age),
-        "gender": report_for_labels(gender_targets, gender_preds, id2gender),
-        "accent": report_for_labels(accent_targets, accent_preds, id2accent),
+        "age": report_for_labels(age_labels, age_preds, id2age),
+        "gender": report_for_labels(gender_labels, gender_preds, id2gender),
+        "accent": report_for_labels(accent_labels, accent_preds, id2accent),
     }
 
     return {
-        "speaker_acc": speaker_acc,
         "age_acc": age_acc,
         "gender_acc": gender_acc,
         "accent_acc": accent_acc,
@@ -507,8 +480,29 @@ def evaluate_reports(model, loader, extractor, device, age2id, id2age, gender2id
     }
 
 
+@torch.no_grad()
+def extract_embeddings_by_speaker(model, features, speaker_ids, device, batch_size):
+    model.eval()
+    embeddings_by_speaker = defaultdict(list)
+    features_t_full = torch.tensor(features, dtype=torch.float32)
+
+    for start, end in iter_batches(features.shape[0], batch_size):
+        feats = features_t_full[start:end].to(device)
+        outputs = model(feats, grl_lambda=1.0)
+        embeddings = outputs["speaker_embedding"].cpu().numpy()
+        for speaker_id, embedding in zip(speaker_ids[start:end], embeddings):
+            embeddings_by_speaker[speaker_id].append(embedding)
+    return embeddings_by_speaker
+
+
+def speaker_verification_metrics(model, features, speaker_ids, device, batch_size, seed):
+    embeddings_by_speaker = extract_embeddings_by_speaker(model, features, speaker_ids, device, batch_size)
+    left, right, labels = sample_verification_trials(embeddings_by_speaker, seed=seed)
+    return verification_metrics(left, right, labels)
+
+
 def main():
-    parser = build_arg_parser("WavLM speaker GRL training on Common Voice 17 English")
+    parser = build_arg_parser("WavLM speaker GRL training on Common Voice 17 English (frozen WavLM features)")
     add_grl_args(parser)
     args = parser.parse_args()
     set_seed(args.seed)
@@ -520,50 +514,117 @@ def main():
     if len(train_dataset) == 0:
         raise ValueError("No fully labeled training examples were found for speaker GRL training.")
 
-    speaker_labels = get_label_list(train_dataset, SPEAKER_COLUMN)
-    gender_labels = get_label_list(train_dataset, GENDER_COLUMN)
-    accent_labels = get_label_list(train_dataset, ACCENT_COLUMN)
-    age_labels = [label for label in ["teens", "twenties", "thirties", "fourties", "fifties_plus"] if label in set(train_dataset[AGE_COLUMN])]
-    if not age_labels:
+    speaker_labels_vocab = get_label_list(train_dataset, SPEAKER_COLUMN)
+    gender_labels_vocab = get_label_list(train_dataset, GENDER_COLUMN)
+    accent_labels_vocab = get_label_list(train_dataset, ACCENT_COLUMN)
+    age_labels_vocab = [label for label in ["teens", "twenties", "thirties", "fourties", "fifties_plus"] if label in set(train_dataset[AGE_COLUMN])]
+    if not age_labels_vocab:
         raise ValueError("No age-bin labels were found in the training split after binning.")
 
-    train_dataset = filter_to_task_labels(train_dataset, speaker_labels, age_labels, gender_labels, accent_labels)
-    val_dataset = filter_to_task_labels(val_dataset, speaker_labels, age_labels, gender_labels, accent_labels)
-    test_dataset = filter_to_task_labels(test_dataset, speaker_labels, age_labels, gender_labels, accent_labels)
+    # Speaker ID is evaluated open-set (verification), so val/test are only
+    # filtered to the shared age/gender/accent label vocab, not to train speakers.
+    train_dataset = filter_to_task_labels(train_dataset, age_labels_vocab, gender_labels_vocab, accent_labels_vocab, speaker_labels=speaker_labels_vocab)
+    val_dataset = filter_to_task_labels(val_dataset, age_labels_vocab, gender_labels_vocab, accent_labels_vocab)
+    test_dataset = filter_to_task_labels(test_dataset, age_labels_vocab, gender_labels_vocab, accent_labels_vocab)
 
     if len(val_dataset) == 0:
         raise ValueError("No labeled validation examples remain after filtering to training labels.")
     if len(test_dataset) == 0:
         raise ValueError("No labeled evaluation examples remain after filtering to training labels.")
 
-    speaker2id, id2speaker = build_label_mapping(speaker_labels)
-    age2id, id2age = build_label_mapping(age_labels)
-    gender2id, id2gender = build_label_mapping(gender_labels)
-    accent2id, id2accent = build_label_mapping(accent_labels)
+    speaker2id, id2speaker = build_label_mapping(speaker_labels_vocab)
+    age2id, id2age = build_label_mapping(age_labels_vocab)
+    gender2id, id2gender = build_label_mapping(gender_labels_vocab)
+    accent2id, id2accent = build_label_mapping(accent_labels_vocab)
 
     print(f"speaker classes ({len(speaker2id)}): {len(speaker2id)} unique client_id values")
-    print(f"age classes ({len(age2id)}): {age_labels}")
-    print(f"gender classes ({len(gender2id)}): {gender_labels}")
-    print(f"accent classes ({len(accent2id)}): {accent_labels}")
+    print(f"age classes ({len(age2id)}): {age_labels_vocab}")
+    print(f"gender classes ({len(gender2id)}): {gender_labels_vocab}")
+    print(f"accent classes ({len(accent2id)}): {accent_labels_vocab}")
     print(f"train samples: {len(train_dataset)} | val samples: {len(val_dataset)} | test samples: {len(test_dataset)}")
 
     train_age_counts = Counter(train_dataset[AGE_COLUMN])
     train_gender_counts = Counter(train_dataset[GENDER_COLUMN])
     train_accent_counts = Counter(train_dataset[ACCENT_COLUMN])
-    print("train age distribution: " + ", ".join(f"{label}: {train_age_counts.get(label, 0)}" for label in age_labels))
+    print("train age distribution: " + ", ".join(f"{label}: {train_age_counts.get(label, 0)}" for label in age_labels_vocab))
     print(
         "train gender distribution: "
-        + ", ".join(f"{label}: {train_gender_counts.get(label, 0)}" for label in gender_labels)
+        + ", ".join(f"{label}: {train_gender_counts.get(label, 0)}" for label in gender_labels_vocab)
     )
     print(
         "train accent distribution: "
-        + ", ".join(f"{label}: {train_accent_counts.get(label, 0)}" for label in accent_labels)
+        + ", ".join(f"{label}: {train_accent_counts.get(label, 0)}" for label in accent_labels_vocab)
     )
 
-    extractor, encoder = load_wavlm_encoder(args.model, args.device, args.trainable_layers)
+    # --- Precompute (or load cached) frozen WavLM embeddings ---
+    # WavLM is never fine-tuned: features are extracted once per split, cached
+    # to disk, and reused across epochs (with `TRAIN_CHUNKS` crop variations
+    # for the training split to keep some augmentation without touching the encoder).
+    print(f"loading/precomputing frozen WavLM embeddings from {args.model} (layer {args.layer})...")
+    X_train, y_train_speaker = load_embeddings(
+        train_dataset,
+        split_name="train",
+        label_column=SPEAKER_COLUMN,
+        label2id=speaker2id,
+        model_name=args.model,
+        layer=args.layer,
+        device=args.device,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        num_chunks=TRAIN_CHUNKS,
+    )
+    X_val, y_val_age = load_embeddings(
+        val_dataset,
+        split_name="val",
+        label_column=AGE_COLUMN,
+        label2id=age2id,
+        model_name=args.model,
+        layer=args.layer,
+        device=args.device,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        num_chunks=EVAL_CHUNKS,
+    )
+    X_test, y_test_age = load_embeddings(
+        test_dataset,
+        split_name="test",
+        label_column=AGE_COLUMN,
+        label2id=age2id,
+        model_name=args.model,
+        layer=args.layer,
+        device=args.device,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        num_chunks=EVAL_CHUNKS,
+    )
+
+    if X_train.ndim == 2:
+        X_train = np.expand_dims(X_train, axis=0)
+    if X_val.ndim == 2:
+        X_val = np.expand_dims(X_val, axis=0)
+    if X_test.ndim == 2:
+        X_test = np.expand_dims(X_test, axis=0)
+
+    y_train_age = labels_to_ids(train_dataset, AGE_COLUMN, age2id)
+    y_train_gender = labels_to_ids(train_dataset, GENDER_COLUMN, gender2id)
+    y_train_accent = labels_to_ids(train_dataset, ACCENT_COLUMN, accent2id)
+
+    y_val_gender = labels_to_ids(val_dataset, GENDER_COLUMN, gender2id)
+    y_val_accent = labels_to_ids(val_dataset, ACCENT_COLUMN, accent2id)
+    val_speaker_ids = val_dataset[SPEAKER_COLUMN]
+
+    y_test_gender = labels_to_ids(test_dataset, GENDER_COLUMN, gender2id)
+    y_test_accent = labels_to_ids(test_dataset, ACCENT_COLUMN, accent2id)
+    test_speaker_ids = test_dataset[SPEAKER_COLUMN]
+
+    scaler = StandardScaler().fit(X_train[0])
+    X_val_scaled = scaler.transform(X_val[0])
+    X_test_scaled = scaler.transform(X_test[0])
+
+    embedding_dim = X_train.shape[-1]
+    print(f"building speaker GRL model with shared dim {args.shared_dim} and speaker embed dim {args.speaker_embed_dim}...")
     model = SpeakerGRLModel(
-        encoder,
-        args.layer,
+        embedding_dim,
         len(speaker2id),
         len(age2id),
         len(gender2id),
@@ -571,40 +632,60 @@ def main():
         args,
     ).to(args.device)
 
-    collate_fn = make_collate_fn(speaker2id, age2id, gender2id, accent2id)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
+    print(f"model has {sum(p.numel() for p in model.parameters() if p.requires_grad)} trainable parameters (WavLM is frozen and not part of this model)")
 
-    trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_parameters, lr=args.clf_lr, weight_decay=args.weight_decay)
+    print(f"training for {args.epochs} epochs with batch size {args.clf_batch_size}, learning rate {args.clf_lr}, weight decay {args.weight_decay}, and patience {args.patience}...")
+    print(f"adversarial loss weights: alpha={args.alpha}, beta={args.beta}, gamma={args.gamma}")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.clf_lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
 
     run_id = time.strftime("%Y%m%d-%H%M%S")
-    best_val_speaker_acc = -1.0
+    best_val_speaker_eer = None
     best_epoch = None
     best_state = None
     patience_left = args.patience
     epoch_rows = []
     start_time = time.perf_counter()
     global_step = 0
+    device = args.device
 
     for epoch in range(args.epochs):
         epoch_start = time.perf_counter()
+
+        # Cycle through precomputed crop variations of the training features.
+        ep_idx = epoch % X_train.shape[0]
+        X_train_ep = scaler.transform(X_train[ep_idx])
+        shuffle_rng = np.random.RandomState(args.seed + epoch)
+
         train_metrics = run_split(
             model,
-            train_loader,
-            extractor,
-            args.device,
+            X_train_ep,
+            device,
             args,
+            age_labels=y_train_age,
+            gender_labels=y_train_gender,
+            accent_labels=y_train_accent,
+            speaker_labels=y_train_speaker,
             train=True,
             optimizer=optimizer,
             step_offset=global_step,
+            shuffle_generator=shuffle_rng,
         )
-        global_step += len(train_loader)
+        global_step += train_metrics["num_batches"]
         scheduler.step()
 
-        val_metrics = run_split(model, val_loader, extractor, args.device, args, train=False)
+        val_metrics = run_split(
+            model,
+            X_val_scaled,
+            device,
+            args,
+            age_labels=y_val_age,
+            gender_labels=y_val_gender,
+            accent_labels=y_val_accent,
+            speaker_labels=None,
+            train=False,
+        )
+        val_verification = speaker_verification_metrics(model, X_val_scaled, val_speaker_ids, device, args.clf_batch_size, args.seed)
         epoch_elapsed = time.perf_counter() - epoch_start
         avg_elapsed = (time.perf_counter() - start_time) / (epoch + 1)
         remaining_seconds = avg_elapsed * (args.epochs - epoch - 1)
@@ -613,13 +694,13 @@ def main():
         print(
             f"epoch {epoch + 1:03d}/{args.epochs:03d} | "
             f"speaker loss {train_metrics['speaker_loss']:.4f} | total loss {train_metrics['total_loss']:.4f} | "
-            f"val speaker acc {val_metrics['speaker_acc']:.4f} | val age acc {val_metrics['age_acc']:.4f} | "
+            f"val speaker EER {val_verification['eer']:.4f} | val age acc {val_metrics['age_acc']:.4f} | "
             f"val gender acc {val_metrics['gender_acc']:.4f} | val accent acc {val_metrics['accent_acc']:.4f} | "
             f"epoch time {epoch_elapsed:.1f}s | eta {eta_minutes:02d}:{eta_seconds:02d}"
         )
 
-        if val_metrics["speaker_acc"] > best_val_speaker_acc:
-            best_val_speaker_acc = val_metrics["speaker_acc"]
+        if best_val_speaker_eer is None or val_verification["eer"] < best_val_speaker_eer:
+            best_val_speaker_eer = val_verification["eer"]
             best_epoch = epoch + 1
             best_state = copy.deepcopy(model.state_dict())
             patience_left = args.patience
@@ -641,11 +722,14 @@ def main():
                 "age_acc": train_metrics["age_acc"],
                 "gender_acc": train_metrics["gender_acc"],
                 "accent_acc": train_metrics["accent_acc"],
+                "speaker_eer": val_verification["eer"],
+                "speaker_auc": val_verification["roc_auc"],
                 "epoch_time_s": epoch_elapsed,
                 "eta_s": remaining_seconds,
                 "best_epoch": best_epoch,
-                "best_val_speaker_acc": best_val_speaker_acc,
-                "test_speaker_acc": None,
+                "best_val_speaker_eer": best_val_speaker_eer,
+                "test_speaker_eer": None,
+                "test_speaker_auc": None,
                 "test_age_acc": None,
                 "test_gender_acc": None,
                 "test_accent_acc": None,
@@ -655,7 +739,6 @@ def main():
                 "accent_classes": len(accent2id),
                 "model": args.model,
                 "layer": args.layer,
-                "trainable_layers": args.trainable_layers,
                 "seed": args.seed,
                 "alpha": args.alpha,
                 "beta": args.beta,
@@ -673,8 +756,21 @@ def main():
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    test_metrics = run_split(model, test_loader, extractor, args.device, args, train=False)
-    test_reports = evaluate_reports(model, test_loader, extractor, args.device, age2id, id2age, gender2id, id2gender, accent2id, id2accent)
+    test_metrics = run_split(
+        model,
+        X_test_scaled,
+        device,
+        args,
+        age_labels=y_test_age,
+        gender_labels=y_test_gender,
+        accent_labels=y_test_accent,
+        speaker_labels=None,
+        train=False,
+    )
+    test_verification = speaker_verification_metrics(model, X_test_scaled, test_speaker_ids, device, args.clf_batch_size, args.seed)
+    test_reports = evaluate_reports(
+        model, X_test_scaled, device, y_test_age, y_test_gender, y_test_accent, args, id2age, id2gender, id2accent
+    )
 
     metrics_rows = [
         *epoch_rows,
@@ -692,11 +788,14 @@ def main():
             "age_acc": None,
             "gender_acc": None,
             "accent_acc": None,
+            "speaker_eer": None,
+            "speaker_auc": None,
             "epoch_time_s": None,
             "eta_s": None,
             "best_epoch": best_epoch,
-            "best_val_speaker_acc": best_val_speaker_acc,
-            "test_speaker_acc": test_metrics["speaker_acc"],
+            "best_val_speaker_eer": best_val_speaker_eer,
+            "test_speaker_eer": test_verification["eer"],
+            "test_speaker_auc": test_verification["roc_auc"],
             "test_age_acc": test_metrics["age_acc"],
             "test_gender_acc": test_metrics["gender_acc"],
             "test_accent_acc": test_metrics["accent_acc"],
@@ -706,7 +805,6 @@ def main():
             "accent_classes": len(accent2id),
             "model": args.model,
             "layer": args.layer,
-            "trainable_layers": args.trainable_layers,
             "seed": args.seed,
             "alpha": args.alpha,
             "beta": args.beta,
@@ -721,8 +819,8 @@ def main():
     metrics_path = get_metrics_csv_path("speaker_grl", args)
     save_metrics_csv(metrics_path, metrics_rows)
 
-    print(f"best val speaker acc: {best_val_speaker_acc:.4f} at epoch {best_epoch}")
-    print(f"test speaker acc: {test_metrics['speaker_acc']:.4f}")
+    print(f"best val speaker EER: {best_val_speaker_eer:.4f} at epoch {best_epoch}")
+    print(f"test speaker EER: {test_verification['eer']:.4f} | AUC: {test_verification['roc_auc']:.4f}")
     print(f"test age acc: {test_metrics['age_acc']:.4f}")
     print(f"test gender acc: {test_metrics['gender_acc']:.4f}")
     print(f"test accent acc: {test_metrics['accent_acc']:.4f}")
