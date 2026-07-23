@@ -74,8 +74,8 @@ def main():
     label2id, id2label = build_label_mapping(full_dataset[LABEL_COLUMN])
     print(f"speaker identities ({len(label2id)}): {len(label2id)} unique client_id values")
     print(f"combined samples: {len(full_dataset)}")
-    train_counts = Counter(train_dataset[LABEL_COLUMN])
-    test_counts = Counter(test_dataset[LABEL_COLUMN])
+    # train_counts = Counter(train_dataset[LABEL_COLUMN])
+    # test_counts = Counter(test_dataset[LABEL_COLUMN])
     # print(
     #     "train speaker distribution: "
     #     + ", ".join(f"{k}: {v}" for k, v in sorted(train_counts.items(), key=lambda x: (-x[1], x[0])))
@@ -86,8 +86,20 @@ def main():
     # )
 
     embeddings, labels = load_embeddings(
-        full_dataset, LABEL_COLUMN, label2id, args.model, args.layer, args.device, args.batch_size
+        full_dataset,
+        split_name="full",
+        label_column=LABEL_COLUMN,
+        label2id=label2id,
+        model_name=args.model,
+        layer=args.layer,
+        device=args.device,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        num_chunks=1,
     )
+    # 2. Select the single chunk variation: [1, num_samples, hidden_dim] -> [num_samples, hidden_dim]
+    if embeddings.ndim == 3:
+        embeddings = embeddings[0]
 
     unique_speakers = np.unique(labels)
     if unique_speakers.size < 4:

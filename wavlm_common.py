@@ -101,25 +101,28 @@ def filter_to_labels(dataset, column, allowed_labels):
     return dataset.filter(lambda x: x[column] in allowed)
 
 
-def crop_or_pad(waveform, seconds=CROP_SECONDS, sr=SAMPLE_RATE):
+def crop_or_pad(waveform, sample_idx=0, epoch_idx=0, seed=42, seconds=CROP_SECONDS, sr=SAMPLE_RATE):
     length = int(sr * seconds)
     n = waveform.shape[-1]
     if n >= length:
-        start = random.SystemRandom().randrange(0, n - length + 1)
+        # Generate a deterministic chunk seed for epoch n and utterance m
+        chunk_seed = hash((seed, epoch_idx, sample_idx)) % (2**31 - 1)
+        rng = random.Random(chunk_seed)
+        start = rng.randrange(0, n - length + 1)
         return waveform[start:start + length]
     return F.pad(waveform, (0, length - n))
 
 
-def load_waveform(audio, sr=SAMPLE_RATE):
+def load_waveform(audio, sample_idx=0, epoch_idx=0, seed=42, sr=SAMPLE_RATE):
     waveform = torch.tensor(audio["array"], dtype=torch.float32)
     audio_sampling_rate = audio["sampling_rate"]
     if audio_sampling_rate != sr:
         waveform = torchaudio.functional.resample(waveform, audio_sampling_rate, sr)
-    return crop_or_pad(waveform, sr=sr)
+    return crop_or_pad(waveform, sample_idx=sample_idx, epoch_idx=epoch_idx, seed=seed, sr=sr)
 
 
 @torch.no_grad()
-def embed_batch(waveforms, extractor, model, layer, device):
+def embed_batch_all_layers(waveforms, extractor, model, device):
     inputs = extractor(
         [w.numpy() for w in waveforms],
         sampling_rate=SAMPLE_RATE,
@@ -130,36 +133,99 @@ def embed_batch(waveforms, extractor, model, layer, device):
     input_values = inputs.input_values.to(device)
     attention_mask = inputs.attention_mask.to(device)
     outputs = model(input_values)
-    hidden = outputs.hidden_states[layer]
-    feat_mask = model._get_feature_vector_attention_mask(hidden.shape[1], attention_mask)
-    feat_mask = feat_mask.unsqueeze(-1).float()
-    pooled = (hidden * feat_mask).sum(1) / feat_mask.sum(1).clamp(min=1)
-    return pooled.cpu().numpy()
+
+    # outputs.hidden_states contains (num_layers + 1) tensors
+    pooled_layers = []
+    for hidden in outputs.hidden_states:
+        feat_mask = model._get_feature_vector_attention_mask(hidden.shape[1], attention_mask)
+        feat_mask = feat_mask.unsqueeze(-1).float()
+        pooled = (hidden * feat_mask).sum(1) / feat_mask.sum(1).clamp(min=1)
+        pooled_layers.append(pooled.cpu().numpy())  # Shape: [batch_size, hidden_dim]
+
+    # Stack along layer dimension -> Shape: [num_layers, batch_size, hidden_dim]
+    return np.stack(pooled_layers, axis=0)
 
 
-def compute_embeddings(dataset, label_column, label2id, extractor, model, layer, device, batch_size):
-    X, y = [], []
-    for i in tqdm(range(0, len(dataset), batch_size), desc="extracting embeddings"):
-        batch = dataset[i:i + batch_size]
-        waveforms = [load_waveform(audio) for audio in batch["audio"]]
-        emb = embed_batch(waveforms, extractor, model, layer, device)
-        X.append(emb)
-        y.extend(label2id[label] for label in batch[label_column])
-    return np.concatenate(X, axis=0), np.array(y)
+# --- Embedding Precomputation & Disk Caching ---
+
+def compute_chunk_variations(
+    dataset, label_column, label2id, extractor, model, device, batch_size, seed, num_chunks=3
+):
+    num_samples = len(dataset)
+    labels = np.array([label2id[label] for label in dataset[label_column]])
+
+    X_chunks = []
+    for chunk_idx in range(num_chunks):
+        X_batches = []
+        for i in tqdm(
+            range(0, num_samples, batch_size),
+            desc=f"Extracting all layers | chunk {chunk_idx + 1}/{num_chunks}"
+        ):
+            batch = dataset[i:i + batch_size]
+            waveforms = [
+                load_waveform(audio, sample_idx=i + idx, epoch_idx=chunk_idx, seed=seed)
+                for idx, audio in enumerate(batch["audio"])
+            ]
+            # Shape: [num_layers, batch_size, hidden_dim]
+            emb = embed_batch_all_layers(waveforms, extractor, model, device)
+            X_batches.append(emb)
+
+        ep_embs = np.concatenate(X_batches, axis=1)  # [num_layers, num_samples, hidden_dim]
+        X_chunks.append(ep_embs)
+
+    X_all = np.stack(X_chunks, axis=0)  # [num_chunks, num_layers, num_samples, hidden_dim]
+    return X_all, labels
 
 
 def load_embeddings(
     dataset,
+    split_name,
     label_column,
     label2id,
     model_name,
     layer,
     device,
     batch_size,
+    seed=42,
+    num_chunks=3,
+    cache_dir="./embeddings_cache",
 ):
-    extractor, model = load_wavlm(model_name, device)
-    return compute_embeddings(dataset, label_column, label2id, extractor, model, layer, device, batch_size)
+    cache_path = Path(cache_dir)
+    clean_model = model_name.replace("/", "_")
 
+    # Folder for this split: embeddings_cache/emb_microsoft_wavlm-base-plus_train_seed42_chunks3_N1256/
+    split_dir = cache_path / f"emb_{clean_model}_{split_name}_seed{seed}_chunks{num_chunks}_N{len(dataset)}"
+    split_dir.mkdir(parents=True, exist_ok=True)
+
+    layer_file = split_dir / f"layer_{layer}.pt"
+
+    # 1. Fast path: load ONLY the requested layer file from disk
+    if layer_file.exists():
+        print(f"Loading precomputed embeddings for layer {layer} from: {layer_file}")
+        cached = torch.load(layer_file, weights_only=False)
+        return cached["X"], cached["y"]
+
+    # 2. Compute path: extract all layers once and save each layer into its own .pt file
+    print(f"Precomputing embeddings for ALL layers of '{split_name}' ({num_chunks} chunk variations)...")
+    extractor, model = load_wavlm(model_name, device)
+    X_all, y = compute_chunk_variations(
+        dataset, label_column, label2id, extractor, model, device, batch_size, seed, num_chunks
+    )
+    # X_all shape: [num_chunks, num_layers, num_samples, hidden_dim]
+
+    num_layers = X_all.shape[1]
+    print(f"Saving per-layer embeddings into folder: {split_dir}")
+
+    # Save layer_0.pt, layer_1.pt, ..., layer_12.pt
+    for l_idx in range(num_layers):
+        l_file = split_dir / f"layer_{l_idx}.pt"
+        torch.save({"X": X_all[:, l_idx], "y": y}, l_file)
+
+    # Save layer_-1.pt as an alias for the final layer
+    torch.save({"X": X_all[:, -1], "y": y}, split_dir / "layer_-1.pt")
+
+    X_layer = X_all[:, layer]
+    return X_layer, y
 
 class ResidualBlock(torch.nn.Module):
     def __init__(self, dim, hidden, dropout):
@@ -255,36 +321,33 @@ def save_training_metrics_csv(metrics_path, rows):
         writer.writerows(rows)
 
 
+# --- Deterministic Training & Batching ---
+
 def train_eval(X_train, y_train, X_val, y_val, X_test, y_test, id2label, args, task_name):
     device = args.device
     run_id = time.strftime("%Y%m%d-%H%M%S")
-    class_ids, class_counts = np.unique(y_train, return_counts=True)
-    distribution = ", ".join(
-        f"{id2label[int(class_id)]}: {int(class_count)}" for class_id, class_count in zip(class_ids, class_counts)
-    )
-    print(f"train class distribution: {distribution}")
 
-    scaler = StandardScaler().fit(X_train)
-    X_train = scaler.transform(X_train)
-    X_val = scaler.transform(X_val)
-    X_test = scaler.transform(X_test)
-    if len(X_val) == 0:
-        raise ValueError(
-            "Validation split is empty. Increase the validation set or provide a non-empty validation split."
-        )
+    # Ensure inputs are 3D tensors: [num_epochs, num_samples, hidden_dim]
+    if X_train.ndim == 2:
+        X_train = np.expand_dims(X_train, axis=0)
+    if X_val.ndim == 2:
+        X_val = np.expand_dims(X_val, axis=0)
+    if X_test.ndim == 2:
+        X_test = np.expand_dims(X_test, axis=0)
 
-    def to_loader(X, y, shuffle):
-        ds = TensorDataset(torch.tensor(X, dtype=torch.float32), torch.tensor(y, dtype=torch.long))
-        return DataLoader(ds, batch_size=args.clf_batch_size, shuffle=shuffle)
+    # Fit scaler on epoch 0 chunk embeddings
+    scaler = StandardScaler().fit(X_train[0])
+    X_val_scaled = scaler.transform(X_val[0])
+    X_test_scaled = scaler.transform(X_test[0])
 
-    train_loader = to_loader(X_train, y_train, True)
-    val_loader = to_loader(X_val, y_val, False)
-    test_loader = to_loader(X_test, y_test, False)
-
-    print(f"split sizes -> train: {len(X_train)} | val: {len(X_val)} | test: {len(X_test)}")
+    val_ds = TensorDataset(torch.tensor(X_val_scaled, dtype=torch.float32), torch.tensor(y_val, dtype=torch.long))
+    test_ds = TensorDataset(torch.tensor(X_test_scaled, dtype=torch.float32), torch.tensor(y_test, dtype=torch.long))
+    
+    val_loader = DataLoader(val_ds, batch_size=args.clf_batch_size, shuffle=False)
+    test_loader = DataLoader(test_ds, batch_size=args.clf_batch_size, shuffle=False)
 
     num_classes = len(id2label)
-    model = ResidualMLP(X_train.shape[1], num_classes, args.hidden_dim, args.num_blocks, args.dropout).to(device)
+    model = ResidualMLP(X_train.shape[-1], num_classes, args.hidden_dim, args.num_blocks, args.dropout).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.clf_lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
@@ -299,9 +362,22 @@ def train_eval(X_train, y_train, X_val, y_val, X_test, y_test, id2label, args, t
     best_epoch = None
     epoch_rows = []
     start_time = time.perf_counter()
+
     for epoch in range(args.epochs):
         epoch_start = time.perf_counter()
         model.train()
+
+        # Get precomputed embeddings for current chunk index: chunk[epoch][m]
+        ep_idx = epoch % X_train.shape[0]
+        X_train_ep = scaler.transform(X_train[ep_idx])
+
+        # Seeding PyTorch DataLoader shuffling ensures identical batch compositions across runs
+        g = torch.Generator()
+        g.manual_seed(args.seed + epoch)
+
+        train_ds = TensorDataset(torch.tensor(X_train_ep, dtype=torch.float32), torch.tensor(y_train, dtype=torch.long))
+        train_loader = DataLoader(train_ds, batch_size=args.clf_batch_size, shuffle=True, generator=g)
+
         train_loss_sum = 0.0
         train_examples = 0
         for xb, yb in train_loader:

@@ -68,13 +68,40 @@ def main():
     )
 
     X_train, y_train = load_embeddings(
-        train_dataset, LABEL_COLUMN, label2id, args.model, args.layer, args.device, args.batch_size
+        train_dataset,
+        split_name="train",
+        label_column=LABEL_COLUMN,
+        label2id=label2id,
+        model_name=args.model,
+        layer=args.layer,
+        device=args.device,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        num_chunks=3,
     )
     X_val, y_val = load_embeddings(
-        val_dataset, LABEL_COLUMN, label2id, args.model, args.layer, args.device, args.batch_size
+        val_dataset,
+        split_name="val",
+        label_column=LABEL_COLUMN,
+        label2id=label2id,
+        model_name=args.model,
+        layer=args.layer,
+        device=args.device,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        num_chunks=1,
     )
     X_test, y_test = load_embeddings(
-        test_dataset, LABEL_COLUMN, label2id, args.model, args.layer, args.device, args.batch_size
+        test_dataset,
+        split_name="test",
+        label_column=LABEL_COLUMN,
+        label2id=label2id,
+        model_name=args.model,
+        layer=args.layer,
+        device=args.device,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        num_chunks=1,
     )
 
     acc, report, metrics_csv = train_eval(
