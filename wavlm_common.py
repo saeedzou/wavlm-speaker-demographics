@@ -56,7 +56,7 @@ def build_arg_parser(description):
 
 
 def add_classification_loss_args(parser):
-    parser.add_argument("--loss", choices=("ce", "focal"), default="ce", help="classification loss to use")
+    parser.add_argument("--loss", choices=("ce", "focal"), default="focal", help="classification loss to use")
     parser.add_argument(
         "--focal_gamma",
         type=float,
