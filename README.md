@@ -1,6 +1,6 @@
 # WavLM Common Voice Experiments
 
-This workspace contains four evaluation scripts built on top of a shared WavLM embedding pipeline for Common Voice 17 English.
+This workspace contains five evaluation scripts built on top of a shared WavLM embedding pipeline for Common Voice 17 English.
 
 ## What This Does
 
@@ -18,6 +18,7 @@ This workspace contains four evaluation scripts built on top of a shared WavLM e
 - `accent_classification.py` - accent classification
 - `age_classification.py` - age classification
 - `speaker_verification.py` - open-set speaker verification
+- `speaker_grl.py` - multitask speaker training with gradient reversal for age, gender, and accent
 
 ## Requirements
 
@@ -47,6 +48,10 @@ Each script supports CLI flags for the WavLM model and the hidden layer:
 - `--layer` to choose a hidden state index
 - `--loss` to choose `ce` or `focal` for the classification scripts
 - `--focal_gamma` to tune focal loss when `--loss focal` is selected
+- `--trainable_layers` in `speaker_grl.py` to choose how many top WavLM layers are fine-tuned; use `-1` to freeze the encoder
+- `--alpha`, `--beta`, and `--gamma` in `speaker_grl.py` to weight the adversarial age, gender, and accent losses
+- `--speaker_margin` and `--speaker_scale` in `speaker_grl.py` to tune the AAM-Softmax speaker head
+- `--grl_ramp_steps` in `speaker_grl.py` to ramp the gradient reversal strength from `0` to `1`
 - `--train_split`, `--val_split`, and `--test_split`
 - `--max_train_samples`, `--max_val_samples`, and `--max_test_samples`
 - `--device`, `--batch_size`, and classifier hyperparameters
@@ -74,6 +79,12 @@ python age_classification.py --model microsoft/wavlm-base-plus --layer -1 --loss
 
 ```bash
 python speaker_verification.py --model microsoft/wavlm-base-plus --layer -1
+```
+
+### Speaker GRL
+
+```bash
+python speaker_grl.py --model microsoft/wavlm-base-plus --layer -1 --trainable_layers 4 --alpha 1.0 --beta 1.0 --gamma 1.0
 ```
 
 ## Typical Workflow
@@ -106,6 +117,13 @@ For speaker verification:
 - `client_id` is treated as the identity label.
 - The script builds open-set verification trials.
 - Final output reports verification metrics such as ROC AUC and EER.
+
+For speaker GRL:
+
+- `client_id` is treated as the main speaker identity label.
+- The WavLM encoder can be partially unfrozen by selecting the number of trainable top layers.
+- The speaker branch uses AAM-Softmax, while age, gender, and accent heads are trained through gradient reversal.
+- A single run reports speaker accuracy plus the adversarial task accuracies and writes them to CSV.
 
 ## Notes
 
