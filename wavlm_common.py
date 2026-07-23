@@ -38,9 +38,11 @@ def build_arg_parser(description):
     parser.add_argument("--dataset_repo", default=DATASET_NAME, help="Hugging Face dataset repository to load")
     parser.add_argument("--layer", type=int, default=-1, help="hidden_states index, -1 for last")
     parser.add_argument("--train_split", default="train")
+    parser.add_argument("--val_split", default="validation")
     parser.add_argument("--test_split", default="test")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--max_train_samples", type=int, default=None)
+    parser.add_argument("--max_val_samples", type=int, default=None)
     parser.add_argument("--max_test_samples", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -319,7 +321,7 @@ def save_training_metrics_csv(metrics_path, rows):
         writer.writerows(rows)
 
 
-def train_eval(X_train, y_train, X_test, y_test, id2label, args, task_name):
+def train_eval(X_train, y_train, X_val, y_val, X_test, y_test, id2label, args, task_name):
     device = args.device
     run_id = time.strftime("%Y%m%d-%H%M%S")
     class_ids, class_counts = np.unique(y_train, return_counts=True)
@@ -330,23 +332,22 @@ def train_eval(X_train, y_train, X_test, y_test, id2label, args, task_name):
 
     scaler = StandardScaler().fit(X_train)
     X_train = scaler.transform(X_train)
+    X_val = scaler.transform(X_val)
     X_test = scaler.transform(X_test)
-
-    X_tr, X_val, y_tr, y_val = safe_stratified_split(X_train, y_train, args.val_ratio, args.seed)
     if len(X_val) == 0:
         raise ValueError(
-            f"Validation split is empty for val_ratio={args.val_ratio}. Increase the training set or validation ratio."
+            "Validation split is empty. Increase the validation set or provide a non-empty validation split."
         )
 
     def to_loader(X, y, shuffle):
         ds = TensorDataset(torch.tensor(X, dtype=torch.float32), torch.tensor(y, dtype=torch.long))
         return DataLoader(ds, batch_size=args.clf_batch_size, shuffle=shuffle)
 
-    train_loader = to_loader(X_tr, y_tr, True)
+    train_loader = to_loader(X_train, y_train, True)
     val_loader = to_loader(X_val, y_val, False)
     test_loader = to_loader(X_test, y_test, False)
 
-    print(f"split sizes -> train: {len(X_tr)} | val: {len(X_val)} | test: {len(X_test)}")
+    print(f"split sizes -> train: {len(X_train)} | val: {len(X_val)} | test: {len(X_test)}")
 
     num_classes = len(id2label)
     model = ResidualMLP(X_train.shape[1], num_classes, args.hidden_dim, args.num_blocks, args.dropout).to(device)

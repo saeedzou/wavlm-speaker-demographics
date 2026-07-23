@@ -48,8 +48,8 @@ Each script supports CLI flags for the WavLM model and the hidden layer:
 - `--layer` to choose a hidden state index
 - `--loss` to choose `ce` or `focal` for the classification scripts
 - `--focal_gamma` to tune focal loss when `--loss focal` is selected
-- `--train_split` and `--test_split`
-- `--max_train_samples` and `--max_test_samples`
+- `--train_split`, `--val_split`, and `--test_split`
+- `--max_train_samples`, `--max_val_samples`, and `--max_test_samples`
 - `--device`, `--batch_size`, and classifier hyperparameters
 - `--cache_dir` to choose where embedding caches are stored
 - `--metrics_csv` to write per-epoch metrics and the final test summary to a CSV file
@@ -92,7 +92,8 @@ python speaker_verification.py --model microsoft/wavlm-base-plus --layer -1
 For the supervised tasks:
 
 - The training split is divided into train and validation subsets.
-- Validation metrics are printed every epoch with ETA.
+- The dataset validation split is used directly for early stopping.
+- Validation class distributions are printed alongside train and test distributions.
 - Early stopping uses validation accuracy.
 - The test split is used only for the final report.
 - Each supervised run also writes a CSV with per-epoch metrics and a final summary row.
